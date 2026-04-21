@@ -72,11 +72,15 @@ select * from read_csv('archive://examples/a.tar.gz!!doesnt_exist.csv');
 ----
 Failed to find file
 
-# No !! after .zip
+# No !! after .zip — with zipfs_split='!!' but a `/` separator in the URL,
+# our VFS falls through to "glob everything" with a malformed archive path.
+# DuckDB's GlobFiles handles this differently across platforms; regex covers
+# both the POSIX "No files found" and the Windows "parameter is incorrect"
+# shapes.
 statement error
 select * from read_csv('archive://examples/a.tar.gz/*.csv', union_by_name = true);
 ----
-No files found that match the pattern
+<REGEX>:.*(No files found that match the pattern|parameter is incorrect).*
 
 # No .zip
 statement error
