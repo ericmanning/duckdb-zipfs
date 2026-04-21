@@ -16,7 +16,15 @@ static void LoadInternal(ExtensionLoader &loader) {
   loader.SetDescription(description);
 
   auto &fs = loader.GetDatabaseInstance().GetFileSystem();
-  fs.RegisterSubSystem(make_uniq<ZipFileSystem>());
+  // The streaming FS hands out regular ZipFileHandle instances on its
+  // degenerate fast-path and binds them to the seekable sibling so they keep
+  // full seekability. Capture the pointer before moving ownership into the
+  // VFS; unique_ptr move doesn't relocate the pointee, and the subsystem
+  // outlives the streaming FS that references it.
+  auto zip_fs_owned = make_uniq<ZipFileSystem>();
+  auto &zip_fs_ref = *zip_fs_owned;
+  fs.RegisterSubSystem(std::move(zip_fs_owned));
+  fs.RegisterSubSystem(make_uniq<StreamingZipFileSystem>(zip_fs_ref));
 #ifdef ENABLE_LIBARCHIVE
   fs.RegisterSubSystem(make_uniq<ArchiveFileSystem>());
   fs.RegisterSubSystem(make_uniq<RawArchiveFileSystem>());

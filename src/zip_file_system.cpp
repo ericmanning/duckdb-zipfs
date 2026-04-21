@@ -6,9 +6,16 @@
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <algorithm>
+#include <cctype>
+
 namespace duckdb {
 
 auto const ZIP_SEPARATOR = "/";
+static constexpr const char *ZIP_SCHEME = "zip://";
+static constexpr size_t ZIP_SCHEME_LEN = 6;
+static constexpr const char *STREAM_SCHEME = "zip-stream://";
+static constexpr size_t STREAM_SCHEME_LEN = 13;
 
 // TODO: Something is incorrect about the type in make_uniq_array<...,
 // std::default_delete<DATA_TYPE>, ...>
@@ -18,6 +25,229 @@ make_uniq_array2(size_t n) // NOLINT: mimic std style
 {
   return unique_ptr<DATA_TYPE[], std::default_delete<DATA_TYPE[]>, true>(
       new DATA_TYPE[n]());
+}
+
+//------------------------------------------------------------------------------
+// Streaming option parsing
+//------------------------------------------------------------------------------
+
+struct ParsedZipPath {
+  bool streaming; // false for zip://, true for zip-stream://
+  // Offset into the original path string where the archive body begins
+  // (i.e., past the scheme and any bracketed options segment).
+  size_t body_offset;
+  // Byte-for-byte options segment, including brackets, e.g. "[lines=10]".
+  // Empty when the URL has no bracketed options. Preserved verbatim for
+  // round-tripping through Glob.
+  string options_literal;
+  StreamingOptions options;
+};
+
+static string DecodeOptionValue(const string &raw, const string &key,
+                                const string &full_url) {
+  string out;
+  out.reserve(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    char c = raw[i];
+    if (c != '\\') {
+      out.push_back(c);
+      continue;
+    }
+    if (i + 1 >= raw.size()) {
+      throw IOException(
+          "Malformed escape sequence in zip-stream option '%s=%s' in URL "
+          "'%s'. Only \\r and \\n are recognized.",
+          key, raw, full_url);
+    }
+    char next = raw[++i];
+    if (next == 'r') {
+      out.push_back('\r');
+    } else if (next == 'n') {
+      out.push_back('\n');
+    } else {
+      throw IOException(
+          "Malformed escape sequence in zip-stream option '%s=%s' in URL "
+          "'%s'. Only \\r and \\n are recognized.",
+          key, raw, full_url);
+    }
+  }
+  return out;
+}
+
+static idx_t ParseSizeWithSuffix(const string &raw, const string &full_url) {
+  if (raw.empty()) {
+    throw IOException(
+        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
+        "optional KB/MB/GB suffix.",
+        raw, full_url);
+  }
+  // Split digits from suffix.
+  size_t digits_end = 0;
+  while (digits_end < raw.size() && std::isdigit(static_cast<unsigned char>(raw[digits_end]))) {
+    ++digits_end;
+  }
+  if (digits_end == 0) {
+    throw IOException(
+        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
+        "optional KB/MB/GB suffix.",
+        raw, full_url);
+  }
+  string digits = raw.substr(0, digits_end);
+  string suffix = raw.substr(digits_end);
+  // Case-insensitive suffix compare.
+  for (auto &c : suffix) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  idx_t multiplier = 1;
+  if (suffix.empty()) {
+    multiplier = 1;
+  } else if (suffix == "KB") {
+    multiplier = 1024ULL;
+  } else if (suffix == "MB") {
+    multiplier = 1024ULL * 1024;
+  } else if (suffix == "GB") {
+    multiplier = 1024ULL * 1024 * 1024;
+  } else {
+    throw IOException(
+        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
+        "optional KB/MB/GB suffix.",
+        raw, full_url);
+  }
+  // Parse the digits portion. Guard against overflow.
+  idx_t base = 0;
+  for (char c : digits) {
+    idx_t d = static_cast<idx_t>(c - '0');
+    if (base > (std::numeric_limits<idx_t>::max() - d) / 10) {
+      throw IOException("Invalid max_bytes value '%s' in URL '%s': numeric "
+                        "overflow.",
+                        raw, full_url);
+    }
+    base = base * 10 + d;
+  }
+  if (multiplier > 1 && base > std::numeric_limits<idx_t>::max() / multiplier) {
+    throw IOException(
+        "Invalid max_bytes value '%s' in URL '%s': numeric overflow.", raw,
+        full_url);
+  }
+  return base * multiplier;
+}
+
+static void ParseStreamingOptions(const string &segment, StreamingOptions &out,
+                                  const string &full_url) {
+  // `segment` is the raw contents between the `[` and `]` brackets.
+  if (segment.empty()) {
+    return;
+  }
+  size_t pos = 0;
+  while (pos < segment.size()) {
+    size_t comma = segment.find(',', pos);
+    string pair =
+        (comma == string::npos) ? segment.substr(pos) : segment.substr(pos, comma - pos);
+    pos = (comma == string::npos) ? segment.size() : comma + 1;
+    // Trim surrounding whitespace for forgiving input.
+    auto is_space = [](char c) {
+      return c == ' ' || c == '\t';
+    };
+    while (!pair.empty() && is_space(pair.front())) pair.erase(pair.begin());
+    while (!pair.empty() && is_space(pair.back())) pair.pop_back();
+    if (pair.empty()) continue;
+    size_t eq = pair.find('=');
+    if (eq == string::npos) {
+      throw IOException(
+          "Malformed zip-stream option '%s' in URL '%s'. Expected key=value.",
+          pair, full_url);
+    }
+    string key = pair.substr(0, eq);
+    string raw_value = pair.substr(eq + 1);
+    // Trim key whitespace as well.
+    while (!key.empty() && is_space(key.back())) key.pop_back();
+    while (!raw_value.empty() && is_space(raw_value.front()))
+      raw_value.erase(raw_value.begin());
+    while (!raw_value.empty() && is_space(raw_value.back()))
+      raw_value.pop_back();
+
+    if (key == "lines") {
+      idx_t n = 0;
+      for (char c : raw_value) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+          throw IOException(
+              "Invalid lines value '%s' in URL '%s'. Expected a non-negative "
+              "integer.",
+              raw_value, full_url);
+        }
+        idx_t d = static_cast<idx_t>(c - '0');
+        if (n > (std::numeric_limits<idx_t>::max() - d) / 10) {
+          throw IOException("Invalid lines value '%s' in URL '%s': numeric "
+                            "overflow.",
+                            raw_value, full_url);
+        }
+        n = n * 10 + d;
+      }
+      out.lines = n;
+    } else if (key == "new_line") {
+      string decoded = DecodeOptionValue(raw_value, key, full_url);
+      if (decoded == "\n") {
+        out.new_line = NewLineMode::LF;
+      } else if (decoded == "\r") {
+        out.new_line = NewLineMode::CR;
+      } else if (decoded == "\r\n") {
+        out.new_line = NewLineMode::CRLF;
+      } else {
+        throw IOException(
+            "Invalid new_line value '%s' in URL '%s'. Must be one of: "
+            "\\n, \\r, \\r\\n.",
+            raw_value, full_url);
+      }
+    } else if (key == "max_bytes") {
+      out.max_bytes = ParseSizeWithSuffix(raw_value, full_url);
+    } else {
+      throw IOException("Unknown zip-stream option '%s' in URL '%s'. Valid "
+                        "keys: lines, new_line, max_bytes.",
+                        key, full_url);
+    }
+  }
+}
+
+// Inspect a file path and return scheme + options segment. For `zip://` paths
+// returns `{streaming=false, body_offset=6, options_literal="", options=defaults}`.
+// For `zip-stream://` paths, also parses any `[...]` options block.
+// Returns false when the path doesn't match either scheme.
+static bool DetectSchemeAndOptions(const string &fpath, ParsedZipPath &out) {
+  if (fpath.size() > ZIP_SCHEME_LEN &&
+      fpath.compare(0, ZIP_SCHEME_LEN, ZIP_SCHEME) == 0) {
+    out.streaming = false;
+    out.body_offset = ZIP_SCHEME_LEN;
+    out.options_literal.clear();
+    out.options = StreamingOptions();
+    return true;
+  }
+  if (fpath.size() > STREAM_SCHEME_LEN &&
+      fpath.compare(0, STREAM_SCHEME_LEN, STREAM_SCHEME) == 0) {
+    out.streaming = true;
+    out.options = StreamingOptions();
+    if (fpath[STREAM_SCHEME_LEN] == '[') {
+      size_t close = fpath.find(']', STREAM_SCHEME_LEN + 1);
+      if (close == string::npos) {
+        throw IOException("Unterminated '[' in zip-stream URL '%s'.", fpath);
+      }
+      string segment =
+          fpath.substr(STREAM_SCHEME_LEN + 1, close - STREAM_SCHEME_LEN - 1);
+      ParseStreamingOptions(segment, out.options, fpath);
+      out.options_literal =
+          fpath.substr(STREAM_SCHEME_LEN, close - STREAM_SCHEME_LEN + 1);
+      out.body_offset = close + 1;
+      // Skip a single separator slash after the bracket group so users can
+      // write zip-stream://[...]/archive.zip/entry.
+      if (out.body_offset < fpath.size() && fpath[out.body_offset] == '/') {
+        out.body_offset += 1;
+      }
+    } else {
+      out.body_offset = STREAM_SCHEME_LEN;
+      out.options_literal.clear();
+    }
+    return true;
+  }
+  return false;
 }
 
 //------------------------------------------------------------------------------
@@ -96,25 +326,76 @@ static pair<string, string> SplitArchivePath(const string &path,
 }
 
 //------------------------------------------------------------------------------
-// Zip File Handle
+// Miniz I/O callback (shared)
 //------------------------------------------------------------------------------
-
-void ZipFileHandle::Close() { inner_handle->Close(); }
-
-//------------------------------------------------------------------------------
-// Zip File System
-//------------------------------------------------------------------------------
-
-bool ZipFileSystem::CanHandleFile(const string &fpath) {
-  // TODO: Check that we can seek into the file
-  return fpath.size() > 6 && fpath.substr(0, 6) == "zip://";
-}
 
 size_t FileSystemZipReadFunc(void *pOpaque, mz_uint64 file_ofs, void *pBuf,
                              size_t n) {
   FileHandle *handle = (FileHandle *)pOpaque;
   handle->Seek(UnsafeNumericCast<idx_t>(file_ofs));
   return UnsafeNumericCast<size_t>(handle->Read(pBuf, n));
+}
+
+//------------------------------------------------------------------------------
+// Line scanner for prefix inflation
+//------------------------------------------------------------------------------
+
+namespace {
+struct LineScanner {
+  NewLineMode mode;
+  uint8_t last_byte = 0;
+  bool have_last = false;
+  idx_t count = 0;
+
+  explicit LineScanner(NewLineMode mode_p) : mode(mode_p) {}
+
+  void Scan(const data_t *data, size_t n) {
+    switch (mode) {
+    case NewLineMode::AUTO:
+    case NewLineMode::LF:
+      for (size_t i = 0; i < n; ++i) {
+        if (data[i] == '\n') ++count;
+      }
+      break;
+    case NewLineMode::CR:
+      for (size_t i = 0; i < n; ++i) {
+        if (data[i] == '\r') ++count;
+      }
+      break;
+    case NewLineMode::CRLF: {
+      uint8_t prev = have_last ? last_byte : 0;
+      for (size_t i = 0; i < n; ++i) {
+        uint8_t b = data[i];
+        if (b == '\n' && prev == '\r') ++count;
+        prev = b;
+      }
+      break;
+    }
+    }
+    if (n > 0) {
+      last_byte = data[n - 1];
+      have_last = true;
+    }
+  }
+};
+} // namespace
+
+//------------------------------------------------------------------------------
+// Zip File Handle
+//------------------------------------------------------------------------------
+
+void ZipFileHandle::Close() { inner_handle->Close(); }
+
+//------------------------------------------------------------------------------
+// Zip File System (zip://)
+//------------------------------------------------------------------------------
+
+bool ZipFileSystem::CanHandleFile(const string &fpath) {
+  // Only the plain `zip://` scheme. `zip-stream://` is handled by
+  // StreamingZipFileSystem below, and never collides here because its prefix
+  // does not match the 6-byte `zip://` compare.
+  return fpath.size() > ZIP_SCHEME_LEN &&
+         fpath.compare(0, ZIP_SCHEME_LEN, ZIP_SCHEME) == 0;
 }
 
 unique_ptr<FileHandle>
@@ -126,7 +407,7 @@ ZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
 
   // Get the path to the zip file
   auto context = opener->TryGetClientContext();
-  const auto paths = SplitArchivePath(path.substr(6), *context);
+  const auto paths = SplitArchivePath(path.substr(ZIP_SCHEME_LEN), *context);
   const auto &zip_path = paths.first;
   const auto &file_path = paths.second;
 
@@ -257,14 +538,18 @@ bool ZipFileSystem::OnDiskFile(FileHandle &handle) {
   return t_handle.inner_handle->OnDiskFile();
 }
 
-vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
-                                         FileOpener *opener) {
-  // Remove the "zip://" prefix
+//------------------------------------------------------------------------------
+// Shared Glob body (used by both ZipFileSystem and StreamingZipFileSystem)
+//------------------------------------------------------------------------------
+
+static vector<OpenFileInfo>
+GlobZip(const string &path, FileOpener *opener, const string &scheme_literal,
+        const string &options_literal, size_t body_offset) {
   auto context = opener->TryGetClientContext();
   auto &fs = FileSystem::GetFileSystem(*context);
-  const auto parts = SplitArchivePath(path.substr(6), *context);
+  const auto parts = SplitArchivePath(path.substr(body_offset), *context);
   auto &zip_path = parts.first;
-  const auto has_glob = HasGlob(zip_path);
+  const auto has_glob = FileSystem::HasGlob(zip_path);
   auto &file_path = parts.second;
 
   // Get matching zip files
@@ -284,11 +569,18 @@ vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
   auto extension =
       !zipfs_split_value.IsNull() ? zipfs_split_value.GetValue<string>() : "";
 
+  // Preserve the bracketed options segment byte-for-byte so downstream consumers
+  // (e.g., the file system that receives the rewritten path back via OpenFile)
+  // parse the same options we just parsed.
+  const string prefix =
+      scheme_literal +
+      (options_literal.empty() ? string() : options_literal + "/");
+
   vector<OpenFileInfo> result;
   for (const auto &curr_zip : matching_zips) {
-    if (!HasGlob(file_path)) {
+    if (!FileSystem::HasGlob(file_path)) {
       // No glob pattern in the file path, just return the file path
-      result.push_back("zip://" + curr_zip.path + extension + ZIP_SEPARATOR +
+      result.push_back(prefix + curr_zip.path + extension + ZIP_SEPARATOR +
                        file_path);
       continue;
     }
@@ -404,8 +696,8 @@ vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
         }
 
         if (match) {
-          auto entry_path = "zip://" + curr_zip.path + extension +
-                            ZIP_SEPARATOR + zip_filename;
+          auto entry_path = prefix + curr_zip.path + extension + ZIP_SEPARATOR +
+                            zip_filename;
           // Cache here???
           result.push_back(entry_path);
         }
@@ -421,11 +713,21 @@ vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
   return result;
 }
 
-bool ZipFileSystem::FileExists(const string &filename,
-                               optional_ptr<FileOpener> opener) {
-  // Remove the "zip://" prefix
+vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
+                                         FileOpener *opener) {
+  return GlobZip(path, opener, ZIP_SCHEME, /*options_literal=*/"",
+                 ZIP_SCHEME_LEN);
+}
+
+//------------------------------------------------------------------------------
+// Shared FileExists body
+//------------------------------------------------------------------------------
+
+static bool FileExistsZip(const string &filename,
+                          optional_ptr<FileOpener> opener, size_t body_offset) {
   auto context = opener->TryGetClientContext();
-  const auto parts = SplitArchivePath(filename.substr(6), *context);
+  const auto parts =
+      SplitArchivePath(filename.substr(body_offset), *context);
   auto &zip_path = parts.first;
   auto &file_path = parts.second;
 
@@ -487,6 +789,389 @@ bool ZipFileSystem::FileExists(const string &filename,
     mz_zip_reader_end(&zip);
     throw;
   }
+}
+
+bool ZipFileSystem::FileExists(const string &filename,
+                               optional_ptr<FileOpener> opener) {
+  return FileExistsZip(filename, opener, ZIP_SCHEME_LEN);
+}
+
+//------------------------------------------------------------------------------
+// Streaming Zip File Handle
+//------------------------------------------------------------------------------
+
+void StreamingZipFileHandle::FreeStream() {
+  if (stream_freed) {
+    return;
+  }
+  if (iter != nullptr) {
+    mz_zip_reader_extract_iter_free(iter);
+    iter = nullptr;
+  }
+  if (zip) {
+    mz_zip_reader_end(zip.get());
+  }
+  stream_freed = true;
+}
+
+StreamingZipFileHandle::~StreamingZipFileHandle() { FreeStream(); }
+
+void StreamingZipFileHandle::Close() {
+  FreeStream();
+  if (inner_handle) {
+    inner_handle->Close();
+  }
+}
+
+//------------------------------------------------------------------------------
+// Streaming Zip File System (zip-stream://)
+//------------------------------------------------------------------------------
+
+bool StreamingZipFileSystem::CanHandleFile(const string &fpath) {
+  return fpath.size() > STREAM_SCHEME_LEN &&
+         fpath.compare(0, STREAM_SCHEME_LEN, STREAM_SCHEME) == 0;
+}
+
+namespace {
+// Context used only while building a streaming handle or its degenerate
+// fallback. Bundles the raw path strings and the inner FileHandle so the
+// OpenFile site can hand ownership off cleanly.
+struct PrefixInflateResult {
+  unique_ptr<data_t[]> prefix;
+  idx_t prefix_filled;
+  bool stream_complete;
+};
+
+static PrefixInflateResult
+InflatePrefix(mz_zip_reader_extract_iter_state *iter, idx_t prefix_capacity,
+              idx_t uncomp_size, const StreamingOptions &options) {
+  PrefixInflateResult r;
+  r.prefix = make_uniq_array2<data_t>(prefix_capacity > 0 ? prefix_capacity : 1);
+  r.prefix_filled = 0;
+  r.stream_complete = false;
+
+  LineScanner scanner(options.new_line);
+  constexpr size_t CHUNK = 64 * 1024;
+
+  while (r.prefix_filled < prefix_capacity && scanner.count < options.lines) {
+    size_t want = std::min<size_t>(CHUNK, prefix_capacity - r.prefix_filled);
+    size_t got =
+        mz_zip_reader_extract_iter_read(iter, r.prefix.get() + r.prefix_filled,
+                                        want);
+    if (got == 0) {
+      // EOF before the stopping condition fired. Could be short read on a
+      // corrupt archive, or a legitimate entry smaller than our cap.
+      r.stream_complete = true;
+      break;
+    }
+    scanner.Scan(r.prefix.get() + r.prefix_filled, got);
+    r.prefix_filled += got;
+    if (r.prefix_filled >= uncomp_size) {
+      r.stream_complete = true;
+      break;
+    }
+  }
+  return r;
+}
+} // namespace
+
+unique_ptr<FileHandle>
+StreamingZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
+                                 optional_ptr<FileOpener> opener) {
+  if (!flags.OpenForReading() || flags.OpenForWriting()) {
+    throw IOException("Zip-stream file system can only open for reading");
+  }
+
+  ParsedZipPath parsed;
+  if (!DetectSchemeAndOptions(path, parsed) || !parsed.streaming) {
+    throw IOException("Internal error: StreamingZipFileSystem::OpenFile called "
+                      "with non-streaming path '%s'",
+                      path);
+  }
+
+  auto context = opener->TryGetClientContext();
+  const auto paths = SplitArchivePath(path.substr(parsed.body_offset), *context);
+  const auto &zip_path = paths.first;
+  const auto &file_path = paths.second;
+
+  auto &fs = FileSystem::GetFileSystem(*context);
+  auto handle = fs.OpenFile(zip_path, flags);
+  if (!handle) {
+    throw IOException("Failed to open file: %s", zip_path);
+  }
+
+  if (file_path.empty()) {
+    return handle;
+  }
+
+  auto normalized_file_path = StringUtil::Replace(
+      file_path, fs.PathSeparator(file_path), ZIP_SEPARATOR);
+
+  if (!handle->CanSeek()) {
+    throw IOException("Cannot seek");
+  }
+
+  idx_t size = handle->GetFileSize();
+
+  // Heap-allocate the archive so its address is stable: miniz's iterator
+  // stores a raw pointer back to the archive, and a stack-local copied by
+  // value into the handle would leave that pointer dangling when OpenFile
+  // returns.
+  auto zip = make_uniq<mz_zip_archive>();
+  mz_zip_zero_struct(zip.get());
+  zip->m_pRead = &FileSystemZipReadFunc;
+  zip->m_pIO_opaque = handle.get();
+
+  mz_zip_reader_extract_iter_state *iter = nullptr;
+  try {
+    mz_uint zip_flags = 0;
+
+    if (!mz_zip_reader_init(zip.get(), size, zip_flags)) {
+      throw IOException(
+          "Could not open as zip file: %s",
+          mz_zip_get_error_string(mz_zip_get_last_error(zip.get())));
+    }
+
+    mz_uint file_index = 0;
+    auto locate_failed = mz_zip_reader_locate_file_v2(
+                             zip.get(), normalized_file_path.c_str(), nullptr,
+                             0, &file_index) == MZ_FALSE;
+    if (locate_failed) {
+      throw IOException("Failed to find file: %s", normalized_file_path);
+    }
+
+    mz_zip_archive_file_stat file_stat = {0};
+    auto stat_failed =
+        mz_zip_reader_file_stat(zip.get(), file_index, &file_stat) == MZ_FALSE;
+    if (stat_failed) {
+      throw IOException(
+          "Problem stat-ing file within archive: %s",
+          mz_zip_get_error_string(mz_zip_get_last_error(zip.get())));
+    }
+    if ((file_stat.m_method) && (file_stat.m_method != MZ_DEFLATED)) {
+      throw IOException("Unknown compression method");
+    }
+
+    const idx_t uncomp_size =
+        UnsafeNumericCast<idx_t>(file_stat.m_uncomp_size);
+    const idx_t prefix_capacity = MinValue(parsed.options.max_bytes, uncomp_size);
+
+    iter = mz_zip_reader_extract_iter_new(zip.get(), file_index, 0);
+    if (iter == nullptr) {
+      throw IOException(
+          "Failed to initialize streaming reader for '%s' in archive '%s': %s",
+          normalized_file_path, zip_path,
+          mz_zip_get_error_string(mz_zip_get_last_error(zip.get())));
+    }
+
+    auto inflated =
+        InflatePrefix(iter, prefix_capacity, uncomp_size, parsed.options);
+
+    if (inflated.prefix_filled >= uncomp_size || inflated.stream_complete) {
+      // Degenerate fast-path: the entry fit entirely in the prefix buffer.
+      // Tear down the streaming state and hand back a regular ZipFileHandle
+      // bound to the *seekable* sibling FS so DuckDB's parallel readers can
+      // engage on this handle exactly as they would for `zip://`.
+      mz_zip_reader_extract_iter_free(iter);
+      iter = nullptr;
+      mz_zip_reader_end(zip.get());
+      return make_uniq<ZipFileHandle>(seekable_fs, path, flags,
+                                      std::move(handle), file_stat,
+                                      std::move(inflated.prefix));
+    }
+
+    // True streaming path: transfer `zip` (heap-owned) and `iter` into the
+    // handle.
+    auto result = make_uniq<StreamingZipFileHandle>(
+        *this, path, flags, std::move(handle), std::move(zip), iter,
+        parsed.options, std::move(inflated.prefix), inflated.prefix_filled,
+        uncomp_size, zip_path, normalized_file_path,
+        /*stream_complete=*/false);
+    // Ownership of `zip` and `iter` now belongs to `result`.
+    iter = nullptr;
+    return result;
+  } catch (Exception &ex) {
+    if (iter != nullptr) {
+      mz_zip_reader_extract_iter_free(iter);
+    }
+    if (zip) {
+      mz_zip_reader_end(zip.get());
+    }
+    throw;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Streaming Read/Seek: prefix-vs-stream boundary rules
+//------------------------------------------------------------------------------
+
+namespace {
+[[noreturn]] void ThrowBackwardSeek(StreamingZipFileHandle &h, idx_t requested) {
+  throw IOException(
+      "Backward seek in zip-stream://: requested offset %llu is before the "
+      "current streaming position %llu (prefix_filled=%llu) for entry '%s' in "
+      "archive '%s'. Use zip:// instead of zip-stream:// to load this file "
+      "fully into memory for random access.",
+      (unsigned long long)requested, (unsigned long long)h.stream_position,
+      (unsigned long long)h.prefix_filled, h.entry_path, h.archive_path);
+}
+
+static void SkipForward(StreamingZipFileHandle &h, idx_t bytes) {
+  constexpr size_t SCRATCH = 64 * 1024;
+  data_t scratch[SCRATCH];
+  while (bytes > 0) {
+    size_t want = (bytes < SCRATCH) ? bytes : SCRATCH;
+    size_t got = mz_zip_reader_extract_iter_read(h.iter, scratch, want);
+    if (got == 0) {
+      throw IOException(
+          "Short read while skipping forward in entry '%s' of archive '%s': %s",
+          h.entry_path, h.archive_path,
+          mz_zip_get_error_string(mz_zip_get_last_error(h.zip.get())));
+    }
+    h.stream_position += got;
+    bytes -= got;
+  }
+}
+
+static void ReadFromStream(StreamingZipFileHandle &h, data_t *buffer, idx_t n) {
+  idx_t have = 0;
+  while (have < n) {
+    size_t got =
+        mz_zip_reader_extract_iter_read(h.iter, buffer + have, n - have);
+    if (got == 0) {
+      if (h.stream_position >= h.uncomp_size) {
+        // Genuine EOF — tolerate short reads at the tail.
+        break;
+      }
+      throw IOException(
+          "Short read from zip entry '%s' in archive '%s': %s",
+          h.entry_path, h.archive_path,
+          mz_zip_get_error_string(mz_zip_get_last_error(h.zip.get())));
+    }
+    have += got;
+    h.stream_position += got;
+  }
+}
+
+static idx_t ReadAtLocation(StreamingZipFileHandle &h, void *buffer_in,
+                            idx_t n, idx_t location) {
+  auto *buffer = static_cast<data_t *>(buffer_in);
+  if (location >= h.uncomp_size || n == 0) {
+    return 0;
+  }
+  if (location + n > h.uncomp_size) {
+    n = h.uncomp_size - location;
+  }
+
+  const idx_t p = location;
+  const idx_t end = p + n;
+
+  if (end <= h.prefix_filled) {
+    // Fully inside prefix.
+    memcpy(buffer, h.prefix.get() + p, n);
+    return n;
+  }
+
+  if (p >= h.prefix_filled) {
+    // Fully past prefix.
+    if (p < h.stream_position) {
+      ThrowBackwardSeek(h, p);
+    }
+    if (p > h.stream_position) {
+      SkipForward(h, p - h.stream_position);
+    }
+    idx_t before = h.stream_position;
+    ReadFromStream(h, buffer, n);
+    return h.stream_position - before;
+  }
+
+  // Straddles the prefix/stream boundary.
+  const idx_t first_part = h.prefix_filled - p;
+  memcpy(buffer, h.prefix.get() + p, first_part);
+  if (h.stream_position != h.prefix_filled) {
+    ThrowBackwardSeek(h, h.prefix_filled);
+  }
+  idx_t before = h.stream_position;
+  ReadFromStream(h, buffer + first_part, n - first_part);
+  return first_part + (h.stream_position - before);
+}
+} // namespace
+
+void StreamingZipFileSystem::Read(FileHandle &handle, void *buffer,
+                                  int64_t nr_bytes, idx_t location) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  ReadAtLocation(h, buffer, UnsafeNumericCast<idx_t>(nr_bytes), location);
+}
+
+int64_t StreamingZipFileSystem::Read(FileHandle &handle, void *buffer,
+                                     int64_t nr_bytes) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  idx_t got = ReadAtLocation(h, buffer, UnsafeNumericCast<idx_t>(nr_bytes),
+                             h.logical_position);
+  h.logical_position += got;
+  return UnsafeNumericCast<int64_t>(got);
+}
+
+int64_t StreamingZipFileSystem::GetFileSize(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  return UnsafeNumericCast<int64_t>(h.uncomp_size);
+}
+
+void StreamingZipFileSystem::Seek(FileHandle &handle, idx_t location) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  // Only mutate the logical cursor. The stream is consulted on the next Read
+  // that actually needs bytes past the prefix, which lets the sniffer's
+  // Read -> Reset -> re-read pattern run entirely out of the prefix buffer.
+  h.logical_position = location;
+}
+
+void StreamingZipFileSystem::Reset(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  h.logical_position = 0;
+}
+
+idx_t StreamingZipFileSystem::SeekPosition(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  return h.logical_position;
+}
+
+timestamp_t StreamingZipFileSystem::GetLastModifiedTime(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  auto &inner_handle = *h.inner_handle;
+  return inner_handle.file_system.GetLastModifiedTime(inner_handle);
+}
+
+FileType StreamingZipFileSystem::GetFileType(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  auto &inner_handle = *h.inner_handle;
+  return inner_handle.file_system.GetFileType(inner_handle);
+}
+
+bool StreamingZipFileSystem::OnDiskFile(FileHandle &handle) {
+  auto &h = handle.Cast<StreamingZipFileHandle>();
+  return h.inner_handle->OnDiskFile();
+}
+
+vector<OpenFileInfo>
+StreamingZipFileSystem::Glob(const string &path, FileOpener *opener) {
+  ParsedZipPath parsed;
+  if (!DetectSchemeAndOptions(path, parsed) || !parsed.streaming) {
+    throw IOException(
+        "Internal error: StreamingZipFileSystem::Glob on non-streaming path "
+        "'%s'",
+        path);
+  }
+  return GlobZip(path, opener, STREAM_SCHEME, parsed.options_literal,
+                 parsed.body_offset);
+}
+
+bool StreamingZipFileSystem::FileExists(const string &filename,
+                                        optional_ptr<FileOpener> opener) {
+  ParsedZipPath parsed;
+  if (!DetectSchemeAndOptions(filename, parsed) || !parsed.streaming) {
+    return false;
+  }
+  return FileExistsZip(filename, opener, parsed.body_offset);
 }
 
 } // namespace duckdb

@@ -1,0 +1,169 @@
+# name: test/sql/zipfs_stream.test
+# description: test zipfs extension streaming zip-stream:// scheme
+# group: [sql]
+
+require zipfs
+
+# ---------------------------------------------------------------------------
+# 1. Degenerate fast-path: entry smaller than max_bytes fits fully in prefix.
+# Must return identical results to the zip:// baseline.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM 'zip-stream://examples/a.zip/a.csv'
+----
+1	2	3
+4	5	6
+7	8	9
+
+# Baseline sanity: same file via zip:// returns the same rows.
+query III
+SELECT * FROM 'zip://examples/a.zip/a.csv'
+----
+1	2	3
+4	5	6
+7	8	9
+
+# Single-column file through the streaming scheme.
+query I
+SELECT * FROM 'zip-stream://examples/a.zip/b.csv'
+----
+99
+98
+97
+
+# ---------------------------------------------------------------------------
+# 2. Medium entry fitting entirely within the default prefix window.
+# Default lines=20480 and max_bytes=64MB absorb any small-file sniffer window.
+# Sniffer's Read -> Reset -> re-read pattern runs purely out of the prefix.
+# ---------------------------------------------------------------------------
+query I
+SELECT COUNT(*) FROM 'zip-stream://examples/a.zip/a.csv'
+----
+3
+
+# ---------------------------------------------------------------------------
+# 3. True streaming path via a tight max_bytes that forces the entry past the
+# prefix cap. This verifies that the read path correctly straddles the
+# prefix/stream boundary and continues inflation through the iter.
+#
+# URLs with `[...]` need hive_partitioning=false because DuckDB's default hive
+# detection sees `key=value` anywhere in a path component and will manufacture
+# a phantom column from the bracket group. See the README for details.
+#
+# Note: backward-seek is a defensive IOException in the code, but DuckDB's
+# parallel CSV reader honors CanSeek=false and reads sequentially, so we do
+# not exercise the backward-seek guard from SQL.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM read_csv('zip-stream://[max_bytes=10]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+1	2	3
+4	5	6
+7	8	9
+
+query I
+SELECT * FROM read_csv('zip-stream://[max_bytes=5]/examples/a.zip/b.csv', hive_partitioning=false)
+----
+99
+98
+97
+
+# max_bytes=1 forces almost every read to hit the stream.
+query III
+SELECT * FROM read_csv('zip-stream://[max_bytes=1]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+1	2	3
+4	5	6
+7	8	9
+
+# ---------------------------------------------------------------------------
+# 4. Option parser: valid forms accepted, invalid forms produce targeted errors.
+# ---------------------------------------------------------------------------
+
+# Full option set accepted (and the explicit \r\n escape decodes correctly).
+query III
+SELECT * FROM read_csv('zip-stream://[lines=10,new_line=\r\n,max_bytes=1KB]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+1	2	3
+4	5	6
+7	8	9
+
+# KB / MB / GB suffixes.
+statement ok
+SELECT * FROM read_csv('zip-stream://[max_bytes=1KB]/examples/a.zip/a.csv', hive_partitioning=false)
+
+statement ok
+SELECT * FROM read_csv('zip-stream://[max_bytes=1MB]/examples/a.zip/a.csv', hive_partitioning=false)
+
+statement ok
+SELECT * FROM read_csv('zip-stream://[max_bytes=1GB]/examples/a.zip/a.csv', hive_partitioning=false)
+
+# new_line=\n and new_line=\r accepted.
+statement ok
+SELECT * FROM read_csv('zip-stream://[new_line=\n]/examples/a.zip/a.csv', hive_partitioning=false)
+
+statement ok
+SELECT * FROM read_csv('zip-stream://[new_line=\r]/examples/a.zip/a.csv', hive_partitioning=false)
+
+# Unknown key -> error.
+statement error
+SELECT * FROM read_csv('zip-stream://[nope=1]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+Unknown zip-stream option 'nope'
+
+# Unknown suffix on max_bytes -> error.
+statement error
+SELECT * FROM read_csv('zip-stream://[max_bytes=1XB]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+Invalid max_bytes value
+
+# Invalid new_line value -> error.
+statement error
+SELECT * FROM read_csv('zip-stream://[new_line=\t]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+Malformed escape sequence
+
+# Non-escape non-\r-\n new_line value -> error.
+statement error
+SELECT * FROM read_csv('zip-stream://[new_line=foo]/examples/a.zip/a.csv', hive_partitioning=false)
+----
+Invalid new_line value
+
+# Unterminated bracket -> error.
+statement error
+SELECT * FROM read_csv('zip-stream://[max_bytes=1KB/examples/a.zip/a.csv', hive_partitioning=false)
+----
+Unterminated '[' in zip-stream URL
+
+# ---------------------------------------------------------------------------
+# 5. Glob preserves the scheme and the bracketed options segment verbatim so
+# rewritten paths flow back into StreamingZipFileSystem::OpenFile with the
+# same options the caller passed in.
+# ---------------------------------------------------------------------------
+query I
+SELECT file FROM glob('zip-stream://[max_bytes=10]/examples/a.zip/*.csv') ORDER BY file
+----
+zip-stream://[max_bytes=10]/examples/a.zip/a.csv
+zip-stream://[max_bytes=10]/examples/a.zip/b.csv
+
+# Globbing multiple zips with options preserved.
+query I
+SELECT file FROM glob('zip-stream://[lines=50,max_bytes=2KB]/examples/a.zip/*.csv') ORDER BY file
+----
+zip-stream://[lines=50,max_bytes=2KB]/examples/a.zip/a.csv
+zip-stream://[lines=50,max_bytes=2KB]/examples/a.zip/b.csv
+
+# No-brackets form: scheme preserved without a spurious options literal.
+query I
+SELECT file FROM glob('zip-stream://examples/a.zip/*.csv') ORDER BY file
+----
+zip-stream://examples/a.zip/a.csv
+zip-stream://examples/a.zip/b.csv
+
+# End-to-end read through a globbed streaming URL works. COUNT(*) so we do
+# not need to second-guess the auto-detected schema's column names; union_by_name
+# because a.csv and b.csv have different column counts.
+query I
+SELECT COUNT(*) FROM read_csv('zip-stream://[max_bytes=5]/examples/a.zip/*.csv', hive_partitioning=false, union_by_name=true)
+----
+6
