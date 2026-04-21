@@ -17,19 +17,22 @@ void LineScanner::Scan(const data_t *data, size_t n) {
   case NewLineMode::AUTO:
   case NewLineMode::LF:
     for (size_t i = 0; i < n; ++i) {
-      if (data[i] == '\n') ++count;
+      if (data[i] == '\n')
+        ++count;
     }
     break;
   case NewLineMode::CR:
     for (size_t i = 0; i < n; ++i) {
-      if (data[i] == '\r') ++count;
+      if (data[i] == '\r')
+        ++count;
     }
     break;
   case NewLineMode::CRLF: {
     uint8_t prev = have_last ? last_byte : 0;
     for (size_t i = 0; i < n; ++i) {
       uint8_t b = data[i];
-      if (b == '\n' && prev == '\r') ++count;
+      if (b == '\n' && prev == '\r')
+        ++count;
       prev = b;
     }
     break;
@@ -119,8 +122,8 @@ static idx_t ParseSizeWithSuffix(const string &raw, const string &full_url) {
     idx_t d = static_cast<idx_t>(c - '0');
     if (base > (std::numeric_limits<idx_t>::max() - d) / 10) {
       throw IOException(
-          "Invalid max_bytes value '%s' in URL '%s': numeric overflow.",
-          raw, full_url);
+          "Invalid max_bytes value '%s' in URL '%s': numeric overflow.", raw,
+          full_url);
     }
     base = base * 10 + d;
   }
@@ -149,9 +152,12 @@ void ParseStreamingOptions(const string &segment, StreamingOptions &out,
     string pair = (comma == string::npos) ? segment.substr(pos)
                                           : segment.substr(pos, comma - pos);
     pos = (comma == string::npos) ? segment.size() : comma + 1;
-    while (!pair.empty() && is_space(pair.front())) pair.erase(pair.begin());
-    while (!pair.empty() && is_space(pair.back())) pair.pop_back();
-    if (pair.empty()) continue;
+    while (!pair.empty() && is_space(pair.front()))
+      pair.erase(pair.begin());
+    while (!pair.empty() && is_space(pair.back()))
+      pair.pop_back();
+    if (pair.empty())
+      continue;
     size_t eq = pair.find('=');
     if (eq == string::npos) {
       throw IOException(
@@ -160,7 +166,8 @@ void ParseStreamingOptions(const string &segment, StreamingOptions &out,
     }
     string key = pair.substr(0, eq);
     string raw_value = pair.substr(eq + 1);
-    while (!key.empty() && is_space(key.back())) key.pop_back();
+    while (!key.empty() && is_space(key.back()))
+      key.pop_back();
     while (!raw_value.empty() && is_space(raw_value.front()))
       raw_value.erase(raw_value.begin());
     while (!raw_value.empty() && is_space(raw_value.back()))

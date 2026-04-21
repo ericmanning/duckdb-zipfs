@@ -17,9 +17,9 @@ static constexpr const char *ARCHIVE_STREAM_SCHEME = "archive-stream://";
 static constexpr size_t ARCHIVE_STREAM_SCHEME_LEN = 17;
 
 struct ParsedArchivePath {
-  bool streaming; // false for archive://, true for archive-stream://
-  string inner_body;       // archive path + entry, past scheme and brackets
-  string options_literal;  // verbatim bracket segment (incl. brackets), for Glob
+  bool streaming;         // false for archive://, true for archive-stream://
+  string inner_body;      // archive path + entry, past scheme and brackets
+  string options_literal; // verbatim bracket segment (incl. brackets), for Glob
   StreamingOptions options;
 };
 
@@ -377,9 +377,10 @@ bool ArchiveFileSystem::OnDiskFile(FileHandle &handle) {
   return t_handle.on_disk_file;
 }
 
-static vector<OpenFileInfo>
-GlobArchive(FileOpener *opener, const string &scheme_literal,
-            const string &options_literal, const string &inner_body) {
+static vector<OpenFileInfo> GlobArchive(FileOpener *opener,
+                                        const string &scheme_literal,
+                                        const string &options_literal,
+                                        const string &inner_body) {
   auto context = opener->TryGetClientContext();
   auto &fs = FileSystem::GetFileSystem(*context);
   const auto parts = SplitArchivePath(inner_body, *context);
@@ -414,8 +415,8 @@ GlobArchive(FileOpener *opener, const string &scheme_literal,
   for (const auto &curr_zip : matching_zips) {
     if (!FileSystem::HasGlob(file_path)) {
       // No glob pattern in the file path, just return the file path
-      result.push_back(path_prefix + curr_zip.path + extension +
-                       ZIP_SEPARATOR + file_path);
+      result.push_back(path_prefix + curr_zip.path + extension + ZIP_SEPARATOR +
+                       file_path);
       continue;
     }
 
@@ -795,8 +796,7 @@ StreamingArchiveFileSystem::OpenFile(const string &path, FileOpenFlags flags,
           found = true;
           if (archive_entry_size_is_set(entry)) {
             size_known = true;
-            uncomp_size =
-                UnsafeNumericCast<idx_t>(archive_entry_size(entry));
+            uncomp_size = UnsafeNumericCast<idx_t>(archive_entry_size(entry));
           }
           break;
         }
@@ -884,8 +884,8 @@ static void SkipForwardArchive(StreamingArchiveFileHandle &h, idx_t bytes) {
   }
 }
 
-static void ReadFromArchiveStream(StreamingArchiveFileHandle &h,
-                                  data_t *buffer, idx_t n) {
+static void ReadFromArchiveStream(StreamingArchiveFileHandle &h, data_t *buffer,
+                                  idx_t n) {
   idx_t have = 0;
   while (have < n) {
     la_ssize_t got = archive_read_data(h.archive, buffer + have, n - have);
@@ -962,9 +962,8 @@ void StreamingArchiveFileSystem::Read(FileHandle &handle, void *buffer,
 int64_t StreamingArchiveFileSystem::Read(FileHandle &handle, void *buffer,
                                          int64_t nr_bytes) {
   auto &h = handle.Cast<StreamingArchiveFileHandle>();
-  idx_t got = ReadArchiveAtLocation(h, buffer,
-                                    UnsafeNumericCast<idx_t>(nr_bytes),
-                                    h.logical_position);
+  idx_t got = ReadArchiveAtLocation(
+      h, buffer, UnsafeNumericCast<idx_t>(nr_bytes), h.logical_position);
   h.logical_position += got;
   return UnsafeNumericCast<int64_t>(got);
 }
@@ -996,7 +995,8 @@ idx_t StreamingArchiveFileSystem::SeekPosition(FileHandle &handle) {
   return h.logical_position;
 }
 
-timestamp_t StreamingArchiveFileSystem::GetLastModifiedTime(FileHandle &handle) {
+timestamp_t
+StreamingArchiveFileSystem::GetLastModifiedTime(FileHandle &handle) {
   auto &h = handle.Cast<StreamingArchiveFileHandle>();
   if (h.has_last_modified_time) {
     return h.last_modified_time;
@@ -1016,8 +1016,8 @@ bool StreamingArchiveFileSystem::OnDiskFile(FileHandle &handle) {
   return h.on_disk_file;
 }
 
-vector<OpenFileInfo>
-StreamingArchiveFileSystem::Glob(const string &path, FileOpener *opener) {
+vector<OpenFileInfo> StreamingArchiveFileSystem::Glob(const string &path,
+                                                      FileOpener *opener) {
   ParsedArchivePath parsed;
   if (!DetectArchiveSchemeAndOptions(path, parsed) || !parsed.streaming) {
     throw IOException(

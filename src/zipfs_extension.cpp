@@ -32,8 +32,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   auto archive_fs_owned = make_uniq<ArchiveFileSystem>();
   auto &archive_fs_ref = *archive_fs_owned;
   fs.RegisterSubSystem(std::move(archive_fs_owned));
-  fs.RegisterSubSystem(
-      make_uniq<StreamingArchiveFileSystem>(archive_fs_ref));
+  fs.RegisterSubSystem(make_uniq<StreamingArchiveFileSystem>(archive_fs_ref));
   fs.RegisterSubSystem(make_uniq<RawArchiveFileSystem>());
 #else
   fs.RegisterSubSystem(make_uniq<NoopArchiveFileSystem>());

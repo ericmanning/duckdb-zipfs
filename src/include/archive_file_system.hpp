@@ -134,16 +134,13 @@ class StreamingArchiveFileHandle final : public FileHandle {
   friend class StreamingArchiveFileSystem;
 
 public:
-  StreamingArchiveFileHandle(FileSystem &file_system, const string &path,
-                             FileOpenFlags flags,
-                             timestamp_t &last_modified_time,
-                             bool has_last_modified_time, FileType file_type,
-                             bool on_disk_file, struct archive *archive,
-                             unique_ptr<LibArchiveHandle> lib_handle,
-                             StreamingOptions options,
-                             unique_ptr<data_t[]> prefix, idx_t prefix_filled,
-                             idx_t uncomp_size, bool size_known,
-                             string archive_path, string entry_path)
+  StreamingArchiveFileHandle(
+      FileSystem &file_system, const string &path, FileOpenFlags flags,
+      timestamp_t &last_modified_time, bool has_last_modified_time,
+      FileType file_type, bool on_disk_file, struct archive *archive,
+      unique_ptr<LibArchiveHandle> lib_handle, StreamingOptions options,
+      unique_ptr<data_t[]> prefix, idx_t prefix_filled, idx_t uncomp_size,
+      bool size_known, string archive_path, string entry_path)
       : FileHandle(file_system, path, flags),
         last_modified_time(last_modified_time),
         has_last_modified_time(has_last_modified_time), file_type(file_type),

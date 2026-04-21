@@ -31,7 +31,7 @@ make_uniq_array2(size_t n) // NOLINT: mimic std style
 //------------------------------------------------------------------------------
 
 struct ParsedZipPath {
-  bool streaming; // false for zip://, true for zip-stream://
+  bool streaming;    // false for zip://, true for zip-stream://
   string inner_body; // the archive path + entry, past scheme and brackets
   // Byte-for-byte options segment (including brackets), preserved verbatim
   // for round-tripping through Glob. Empty when no bracketed options.
@@ -308,9 +308,10 @@ bool ZipFileSystem::OnDiskFile(FileHandle &handle) {
 // Shared Glob body (used by both ZipFileSystem and StreamingZipFileSystem)
 //------------------------------------------------------------------------------
 
-static vector<OpenFileInfo>
-GlobZip(FileOpener *opener, const string &scheme_literal,
-        const string &options_literal, const string &inner_body) {
+static vector<OpenFileInfo> GlobZip(FileOpener *opener,
+                                    const string &scheme_literal,
+                                    const string &options_literal,
+                                    const string &inner_body) {
   auto context = opener->TryGetClientContext();
   auto &fs = FileSystem::GetFileSystem(*context);
   const auto parts = SplitArchivePath(inner_body, *context);
@@ -335,9 +336,9 @@ GlobZip(FileOpener *opener, const string &scheme_literal,
   auto extension =
       !zipfs_split_value.IsNull() ? zipfs_split_value.GetValue<string>() : "";
 
-  // Preserve the bracketed options segment byte-for-byte so downstream consumers
-  // (e.g., the file system that receives the rewritten path back via OpenFile)
-  // parse the same options we just parsed.
+  // Preserve the bracketed options segment byte-for-byte so downstream
+  // consumers (e.g., the file system that receives the rewritten path back via
+  // OpenFile) parse the same options we just parsed.
   const string prefix =
       scheme_literal +
       (options_literal.empty() ? string() : options_literal + "/");
@@ -462,8 +463,8 @@ GlobZip(FileOpener *opener, const string &scheme_literal,
         }
 
         if (match) {
-          auto entry_path = prefix + curr_zip.path + extension + ZIP_SEPARATOR +
-                            zip_filename;
+          auto entry_path =
+              prefix + curr_zip.path + extension + ZIP_SEPARATOR + zip_filename;
           // Cache here???
           result.push_back(entry_path);
         }
@@ -607,11 +608,13 @@ struct PrefixInflateResult {
   bool stream_complete;
 };
 
-static PrefixInflateResult
-InflatePrefix(mz_zip_reader_extract_iter_state *iter, idx_t prefix_capacity,
-              idx_t uncomp_size, const StreamingOptions &options) {
+static PrefixInflateResult InflatePrefix(mz_zip_reader_extract_iter_state *iter,
+                                         idx_t prefix_capacity,
+                                         idx_t uncomp_size,
+                                         const StreamingOptions &options) {
   PrefixInflateResult r;
-  r.prefix = make_uniq_array2<data_t>(prefix_capacity > 0 ? prefix_capacity : 1);
+  r.prefix =
+      make_uniq_array2<data_t>(prefix_capacity > 0 ? prefix_capacity : 1);
   r.prefix_filled = 0;
   r.stream_complete = false;
 
@@ -620,9 +623,8 @@ InflatePrefix(mz_zip_reader_extract_iter_state *iter, idx_t prefix_capacity,
 
   while (r.prefix_filled < prefix_capacity && scanner.count < options.lines) {
     size_t want = std::min<size_t>(CHUNK, prefix_capacity - r.prefix_filled);
-    size_t got =
-        mz_zip_reader_extract_iter_read(iter, r.prefix.get() + r.prefix_filled,
-                                        want);
+    size_t got = mz_zip_reader_extract_iter_read(
+        iter, r.prefix.get() + r.prefix_filled, want);
     if (got == 0) {
       // EOF before the stopping condition fired. Could be short read on a
       // corrupt archive, or a legitimate entry smaller than our cap.
@@ -698,9 +700,9 @@ StreamingZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
     }
 
     mz_uint file_index = 0;
-    auto locate_failed = mz_zip_reader_locate_file_v2(
-                             zip.get(), normalized_file_path.c_str(), nullptr,
-                             0, &file_index) == MZ_FALSE;
+    auto locate_failed =
+        mz_zip_reader_locate_file_v2(zip.get(), normalized_file_path.c_str(),
+                                     nullptr, 0, &file_index) == MZ_FALSE;
     if (locate_failed) {
       throw IOException("Failed to find file: %s", normalized_file_path);
     }
@@ -717,9 +719,9 @@ StreamingZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
       throw IOException("Unknown compression method");
     }
 
-    const idx_t uncomp_size =
-        UnsafeNumericCast<idx_t>(file_stat.m_uncomp_size);
-    const idx_t prefix_capacity = MinValue(parsed.options.max_bytes, uncomp_size);
+    const idx_t uncomp_size = UnsafeNumericCast<idx_t>(file_stat.m_uncomp_size);
+    const idx_t prefix_capacity =
+        MinValue(parsed.options.max_bytes, uncomp_size);
 
     iter = mz_zip_reader_extract_iter_new(zip.get(), file_index, 0);
     if (iter == nullptr) {
@@ -771,7 +773,8 @@ StreamingZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
 //------------------------------------------------------------------------------
 
 namespace {
-[[noreturn]] void ThrowBackwardSeek(StreamingZipFileHandle &h, idx_t requested) {
+[[noreturn]] void ThrowBackwardSeek(StreamingZipFileHandle &h,
+                                    idx_t requested) {
   throw IOException(
       "Backward seek in zip-stream://: requested offset %llu is before the "
       "current streaming position %llu (prefix_filled=%llu) for entry '%s' in "
@@ -809,8 +812,8 @@ static void ReadFromStream(StreamingZipFileHandle &h, data_t *buffer, idx_t n) {
         break;
       }
       throw IOException(
-          "Short read from zip entry '%s' in archive '%s': %s",
-          h.entry_path, h.archive_path,
+          "Short read from zip entry '%s' in archive '%s': %s", h.entry_path,
+          h.archive_path,
           mz_zip_get_error_string(mz_zip_get_last_error(h.zip.get())));
     }
     have += got;
@@ -818,8 +821,8 @@ static void ReadFromStream(StreamingZipFileHandle &h, data_t *buffer, idx_t n) {
   }
 }
 
-static idx_t ReadAtLocation(StreamingZipFileHandle &h, void *buffer_in,
-                            idx_t n, idx_t location) {
+static idx_t ReadAtLocation(StreamingZipFileHandle &h, void *buffer_in, idx_t n,
+                            idx_t location) {
   auto *buffer = static_cast<data_t *>(buffer_in);
   if (location >= h.uncomp_size || n == 0) {
     return 0;
@@ -917,8 +920,8 @@ bool StreamingZipFileSystem::OnDiskFile(FileHandle &handle) {
   return h.inner_handle->OnDiskFile();
 }
 
-vector<OpenFileInfo>
-StreamingZipFileSystem::Glob(const string &path, FileOpener *opener) {
+vector<OpenFileInfo> StreamingZipFileSystem::Glob(const string &path,
+                                                  FileOpener *opener) {
   ParsedZipPath parsed;
   if (!DetectSchemeAndOptions(path, parsed) || !parsed.streaming) {
     throw IOException(
