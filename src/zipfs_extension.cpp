@@ -26,7 +26,14 @@ static void LoadInternal(ExtensionLoader &loader) {
   fs.RegisterSubSystem(std::move(zip_fs_owned));
   fs.RegisterSubSystem(make_uniq<StreamingZipFileSystem>(zip_fs_ref));
 #ifdef ENABLE_LIBARCHIVE
-  fs.RegisterSubSystem(make_uniq<ArchiveFileSystem>());
+  // Same seekable-sibling wiring as the zip streaming FS: capture the raw
+  // reference before moving ownership into the VFS so the streaming FS can
+  // return regular ArchiveFileHandle instances on its degenerate fast-path.
+  auto archive_fs_owned = make_uniq<ArchiveFileSystem>();
+  auto &archive_fs_ref = *archive_fs_owned;
+  fs.RegisterSubSystem(std::move(archive_fs_owned));
+  fs.RegisterSubSystem(
+      make_uniq<StreamingArchiveFileSystem>(archive_fs_ref));
   fs.RegisterSubSystem(make_uniq<RawArchiveFileSystem>());
 #else
   fs.RegisterSubSystem(make_uniq<NoopArchiveFileSystem>());

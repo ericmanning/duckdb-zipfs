@@ -7,7 +7,6 @@
 #include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
-#include <cctype>
 
 namespace duckdb {
 
@@ -28,223 +27,34 @@ make_uniq_array2(size_t n) // NOLINT: mimic std style
 }
 
 //------------------------------------------------------------------------------
-// Streaming option parsing
+// Scheme detection
 //------------------------------------------------------------------------------
 
 struct ParsedZipPath {
   bool streaming; // false for zip://, true for zip-stream://
-  // Offset into the original path string where the archive body begins
-  // (i.e., past the scheme and any bracketed options segment).
-  size_t body_offset;
-  // Byte-for-byte options segment, including brackets, e.g. "[lines=10]".
-  // Empty when the URL has no bracketed options. Preserved verbatim for
-  // round-tripping through Glob.
+  string inner_body; // the archive path + entry, past scheme and brackets
+  // Byte-for-byte options segment (including brackets), preserved verbatim
+  // for round-tripping through Glob. Empty when no bracketed options.
   string options_literal;
   StreamingOptions options;
 };
 
-static string DecodeOptionValue(const string &raw, const string &key,
-                                const string &full_url) {
-  string out;
-  out.reserve(raw.size());
-  for (size_t i = 0; i < raw.size(); ++i) {
-    char c = raw[i];
-    if (c != '\\') {
-      out.push_back(c);
-      continue;
-    }
-    if (i + 1 >= raw.size()) {
-      throw IOException(
-          "Malformed escape sequence in zip-stream option '%s=%s' in URL "
-          "'%s'. Only \\r and \\n are recognized.",
-          key, raw, full_url);
-    }
-    char next = raw[++i];
-    if (next == 'r') {
-      out.push_back('\r');
-    } else if (next == 'n') {
-      out.push_back('\n');
-    } else {
-      throw IOException(
-          "Malformed escape sequence in zip-stream option '%s=%s' in URL "
-          "'%s'. Only \\r and \\n are recognized.",
-          key, raw, full_url);
-    }
-  }
-  return out;
-}
-
-static idx_t ParseSizeWithSuffix(const string &raw, const string &full_url) {
-  if (raw.empty()) {
-    throw IOException(
-        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
-        "optional KB/MB/GB suffix.",
-        raw, full_url);
-  }
-  // Split digits from suffix.
-  size_t digits_end = 0;
-  while (digits_end < raw.size() && std::isdigit(static_cast<unsigned char>(raw[digits_end]))) {
-    ++digits_end;
-  }
-  if (digits_end == 0) {
-    throw IOException(
-        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
-        "optional KB/MB/GB suffix.",
-        raw, full_url);
-  }
-  string digits = raw.substr(0, digits_end);
-  string suffix = raw.substr(digits_end);
-  // Case-insensitive suffix compare.
-  for (auto &c : suffix) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  idx_t multiplier = 1;
-  if (suffix.empty()) {
-    multiplier = 1;
-  } else if (suffix == "KB") {
-    multiplier = 1024ULL;
-  } else if (suffix == "MB") {
-    multiplier = 1024ULL * 1024;
-  } else if (suffix == "GB") {
-    multiplier = 1024ULL * 1024 * 1024;
-  } else {
-    throw IOException(
-        "Invalid max_bytes value '%s' in URL '%s'. Expected integer with "
-        "optional KB/MB/GB suffix.",
-        raw, full_url);
-  }
-  // Parse the digits portion. Guard against overflow.
-  idx_t base = 0;
-  for (char c : digits) {
-    idx_t d = static_cast<idx_t>(c - '0');
-    if (base > (std::numeric_limits<idx_t>::max() - d) / 10) {
-      throw IOException("Invalid max_bytes value '%s' in URL '%s': numeric "
-                        "overflow.",
-                        raw, full_url);
-    }
-    base = base * 10 + d;
-  }
-  if (multiplier > 1 && base > std::numeric_limits<idx_t>::max() / multiplier) {
-    throw IOException(
-        "Invalid max_bytes value '%s' in URL '%s': numeric overflow.", raw,
-        full_url);
-  }
-  return base * multiplier;
-}
-
-static void ParseStreamingOptions(const string &segment, StreamingOptions &out,
-                                  const string &full_url) {
-  // `segment` is the raw contents between the `[` and `]` brackets.
-  if (segment.empty()) {
-    return;
-  }
-  size_t pos = 0;
-  while (pos < segment.size()) {
-    size_t comma = segment.find(',', pos);
-    string pair =
-        (comma == string::npos) ? segment.substr(pos) : segment.substr(pos, comma - pos);
-    pos = (comma == string::npos) ? segment.size() : comma + 1;
-    // Trim surrounding whitespace for forgiving input.
-    auto is_space = [](char c) {
-      return c == ' ' || c == '\t';
-    };
-    while (!pair.empty() && is_space(pair.front())) pair.erase(pair.begin());
-    while (!pair.empty() && is_space(pair.back())) pair.pop_back();
-    if (pair.empty()) continue;
-    size_t eq = pair.find('=');
-    if (eq == string::npos) {
-      throw IOException(
-          "Malformed zip-stream option '%s' in URL '%s'. Expected key=value.",
-          pair, full_url);
-    }
-    string key = pair.substr(0, eq);
-    string raw_value = pair.substr(eq + 1);
-    // Trim key whitespace as well.
-    while (!key.empty() && is_space(key.back())) key.pop_back();
-    while (!raw_value.empty() && is_space(raw_value.front()))
-      raw_value.erase(raw_value.begin());
-    while (!raw_value.empty() && is_space(raw_value.back()))
-      raw_value.pop_back();
-
-    if (key == "lines") {
-      idx_t n = 0;
-      for (char c : raw_value) {
-        if (!std::isdigit(static_cast<unsigned char>(c))) {
-          throw IOException(
-              "Invalid lines value '%s' in URL '%s'. Expected a non-negative "
-              "integer.",
-              raw_value, full_url);
-        }
-        idx_t d = static_cast<idx_t>(c - '0');
-        if (n > (std::numeric_limits<idx_t>::max() - d) / 10) {
-          throw IOException("Invalid lines value '%s' in URL '%s': numeric "
-                            "overflow.",
-                            raw_value, full_url);
-        }
-        n = n * 10 + d;
-      }
-      out.lines = n;
-    } else if (key == "new_line") {
-      string decoded = DecodeOptionValue(raw_value, key, full_url);
-      if (decoded == "\n") {
-        out.new_line = NewLineMode::LF;
-      } else if (decoded == "\r") {
-        out.new_line = NewLineMode::CR;
-      } else if (decoded == "\r\n") {
-        out.new_line = NewLineMode::CRLF;
-      } else {
-        throw IOException(
-            "Invalid new_line value '%s' in URL '%s'. Must be one of: "
-            "\\n, \\r, \\r\\n.",
-            raw_value, full_url);
-      }
-    } else if (key == "max_bytes") {
-      out.max_bytes = ParseSizeWithSuffix(raw_value, full_url);
-    } else {
-      throw IOException("Unknown zip-stream option '%s' in URL '%s'. Valid "
-                        "keys: lines, new_line, max_bytes.",
-                        key, full_url);
-    }
-  }
-}
-
-// Inspect a file path and return scheme + options segment. For `zip://` paths
-// returns `{streaming=false, body_offset=6, options_literal="", options=defaults}`.
-// For `zip-stream://` paths, also parses any `[...]` options block.
-// Returns false when the path doesn't match either scheme.
+// Dispatches on the zip:// or zip-stream:// scheme prefix and, for
+// zip-stream://, defers bracketed-options parsing to the shared helper.
 static bool DetectSchemeAndOptions(const string &fpath, ParsedZipPath &out) {
   if (fpath.size() > ZIP_SCHEME_LEN &&
       fpath.compare(0, ZIP_SCHEME_LEN, ZIP_SCHEME) == 0) {
     out.streaming = false;
-    out.body_offset = ZIP_SCHEME_LEN;
     out.options_literal.clear();
     out.options = StreamingOptions();
+    out.inner_body = fpath.substr(ZIP_SCHEME_LEN);
     return true;
   }
   if (fpath.size() > STREAM_SCHEME_LEN &&
       fpath.compare(0, STREAM_SCHEME_LEN, STREAM_SCHEME) == 0) {
     out.streaming = true;
-    out.options = StreamingOptions();
-    if (fpath[STREAM_SCHEME_LEN] == '[') {
-      size_t close = fpath.find(']', STREAM_SCHEME_LEN + 1);
-      if (close == string::npos) {
-        throw IOException("Unterminated '[' in zip-stream URL '%s'.", fpath);
-      }
-      string segment =
-          fpath.substr(STREAM_SCHEME_LEN + 1, close - STREAM_SCHEME_LEN - 1);
-      ParseStreamingOptions(segment, out.options, fpath);
-      out.options_literal =
-          fpath.substr(STREAM_SCHEME_LEN, close - STREAM_SCHEME_LEN + 1);
-      out.body_offset = close + 1;
-      // Skip a single separator slash after the bracket group so users can
-      // write zip-stream://[...]/archive.zip/entry.
-      if (out.body_offset < fpath.size() && fpath[out.body_offset] == '/') {
-        out.body_offset += 1;
-      }
-    } else {
-      out.body_offset = STREAM_SCHEME_LEN;
-      out.options_literal.clear();
-    }
+    ParseBracketedOptions(fpath.substr(STREAM_SCHEME_LEN), fpath, out.options,
+                          out.options_literal, out.inner_body);
     return true;
   }
   return false;
@@ -335,50 +145,6 @@ size_t FileSystemZipReadFunc(void *pOpaque, mz_uint64 file_ofs, void *pBuf,
   handle->Seek(UnsafeNumericCast<idx_t>(file_ofs));
   return UnsafeNumericCast<size_t>(handle->Read(pBuf, n));
 }
-
-//------------------------------------------------------------------------------
-// Line scanner for prefix inflation
-//------------------------------------------------------------------------------
-
-namespace {
-struct LineScanner {
-  NewLineMode mode;
-  uint8_t last_byte = 0;
-  bool have_last = false;
-  idx_t count = 0;
-
-  explicit LineScanner(NewLineMode mode_p) : mode(mode_p) {}
-
-  void Scan(const data_t *data, size_t n) {
-    switch (mode) {
-    case NewLineMode::AUTO:
-    case NewLineMode::LF:
-      for (size_t i = 0; i < n; ++i) {
-        if (data[i] == '\n') ++count;
-      }
-      break;
-    case NewLineMode::CR:
-      for (size_t i = 0; i < n; ++i) {
-        if (data[i] == '\r') ++count;
-      }
-      break;
-    case NewLineMode::CRLF: {
-      uint8_t prev = have_last ? last_byte : 0;
-      for (size_t i = 0; i < n; ++i) {
-        uint8_t b = data[i];
-        if (b == '\n' && prev == '\r') ++count;
-        prev = b;
-      }
-      break;
-    }
-    }
-    if (n > 0) {
-      last_byte = data[n - 1];
-      have_last = true;
-    }
-  }
-};
-} // namespace
 
 //------------------------------------------------------------------------------
 // Zip File Handle
@@ -543,11 +309,11 @@ bool ZipFileSystem::OnDiskFile(FileHandle &handle) {
 //------------------------------------------------------------------------------
 
 static vector<OpenFileInfo>
-GlobZip(const string &path, FileOpener *opener, const string &scheme_literal,
-        const string &options_literal, size_t body_offset) {
+GlobZip(FileOpener *opener, const string &scheme_literal,
+        const string &options_literal, const string &inner_body) {
   auto context = opener->TryGetClientContext();
   auto &fs = FileSystem::GetFileSystem(*context);
-  const auto parts = SplitArchivePath(path.substr(body_offset), *context);
+  const auto parts = SplitArchivePath(inner_body, *context);
   auto &zip_path = parts.first;
   const auto has_glob = FileSystem::HasGlob(zip_path);
   auto &file_path = parts.second;
@@ -715,19 +481,18 @@ GlobZip(const string &path, FileOpener *opener, const string &scheme_literal,
 
 vector<OpenFileInfo> ZipFileSystem::Glob(const string &path,
                                          FileOpener *opener) {
-  return GlobZip(path, opener, ZIP_SCHEME, /*options_literal=*/"",
-                 ZIP_SCHEME_LEN);
+  return GlobZip(opener, ZIP_SCHEME, /*options_literal=*/"",
+                 path.substr(ZIP_SCHEME_LEN));
 }
 
 //------------------------------------------------------------------------------
 // Shared FileExists body
 //------------------------------------------------------------------------------
 
-static bool FileExistsZip(const string &filename,
-                          optional_ptr<FileOpener> opener, size_t body_offset) {
+static bool FileExistsZip(optional_ptr<FileOpener> opener,
+                          const string &inner_body) {
   auto context = opener->TryGetClientContext();
-  const auto parts =
-      SplitArchivePath(filename.substr(body_offset), *context);
+  const auto parts = SplitArchivePath(inner_body, *context);
   auto &zip_path = parts.first;
   auto &file_path = parts.second;
 
@@ -793,7 +558,7 @@ static bool FileExistsZip(const string &filename,
 
 bool ZipFileSystem::FileExists(const string &filename,
                                optional_ptr<FileOpener> opener) {
-  return FileExistsZip(filename, opener, ZIP_SCHEME_LEN);
+  return FileExistsZip(opener, filename.substr(ZIP_SCHEME_LEN));
 }
 
 //------------------------------------------------------------------------------
@@ -890,7 +655,7 @@ StreamingZipFileSystem::OpenFile(const string &path, FileOpenFlags flags,
   }
 
   auto context = opener->TryGetClientContext();
-  const auto paths = SplitArchivePath(path.substr(parsed.body_offset), *context);
+  const auto paths = SplitArchivePath(parsed.inner_body, *context);
   const auto &zip_path = paths.first;
   const auto &file_path = paths.second;
 
@@ -1161,8 +926,8 @@ StreamingZipFileSystem::Glob(const string &path, FileOpener *opener) {
         "'%s'",
         path);
   }
-  return GlobZip(path, opener, STREAM_SCHEME, parsed.options_literal,
-                 parsed.body_offset);
+  return GlobZip(opener, STREAM_SCHEME, parsed.options_literal,
+                 parsed.inner_body);
 }
 
 bool StreamingZipFileSystem::FileExists(const string &filename,
@@ -1171,7 +936,7 @@ bool StreamingZipFileSystem::FileExists(const string &filename,
   if (!DetectSchemeAndOptions(filename, parsed) || !parsed.streaming) {
     return false;
   }
-  return FileExistsZip(filename, opener, parsed.body_offset);
+  return FileExistsZip(opener, parsed.inner_body);
 }
 
 } // namespace duckdb

@@ -1,0 +1,126 @@
+# name: test/sql/archivefs_stream.test
+# description: test zipfs extension streaming archive-stream:// scheme
+# group: [sql]
+
+require zipfs
+
+require notwindows
+
+# All archive-stream:// URLs use zipfs_split='!!' to separate the archive
+# from the entry, matching the pattern the existing archive:// tests use.
+statement ok
+SET zipfs_split='!!';
+
+# ---------------------------------------------------------------------------
+# 1. Degenerate fast-path on tar.gz: small entry fits fully in prefix.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM 'archive-stream://examples/a.tar.gz!!a.csv'
+----
+1	2	3
+4	5	6
+7	8	9
+
+query I
+SELECT * FROM 'archive-stream://examples/a.tar.gz!!b.csv'
+----
+99
+98
+97
+
+# ---------------------------------------------------------------------------
+# 2. Streaming path on tar.gz: tight max_bytes forces prefix-vs-stream boundary.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM read_csv('archive-stream://[max_bytes=10]/examples/a.tar.gz!!a.csv', hive_partitioning=false)
+----
+1	2	3
+4	5	6
+7	8	9
+
+query I
+SELECT * FROM read_csv('archive-stream://[max_bytes=3]/examples/a.tar.gz!!b.csv', hive_partitioning=false)
+----
+99
+98
+97
+
+# ---------------------------------------------------------------------------
+# 3. 7z (LZMA2) single-entry read: basic 7z plumbing works at all.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM 'archive-stream://examples/a.7z!!a.csv'
+----
+1	2	3
+4	5	6
+7	8	9
+
+# ---------------------------------------------------------------------------
+# 4. Solid 7z, mid-folder entry: reading b.csv requires libarchive to
+# decompress through earlier entries in the solid block. Memory stays bounded
+# (the streaming path doesn't accumulate the preceding entries).
+# ---------------------------------------------------------------------------
+query I
+SELECT * FROM 'archive-stream://examples/a.7z!!b.csv'
+----
+99
+98
+97
+
+# Deepest entry — exercises the walk through every preceding entry in the
+# solid folder.
+query I
+SELECT hello FROM 'archive-stream://examples/a.7z!!nested_dir/some_file.csv'
+----
+world
+
+# ---------------------------------------------------------------------------
+# 5. Option parser: valid forms accepted, invalid forms produce targeted errors.
+# Reuses the shared helpers exercised by zipfs_stream.test, so we only cover
+# an abbreviated matrix here.
+# ---------------------------------------------------------------------------
+
+# Full option set accepted.
+query III
+SELECT * FROM read_csv('archive-stream://[lines=10,new_line=\n,max_bytes=1KB]/examples/a.tar.gz!!a.csv', hive_partitioning=false)
+----
+1	2	3
+4	5	6
+7	8	9
+
+# Unknown key -> error.
+statement error
+SELECT * FROM read_csv('archive-stream://[nope=1]/examples/a.tar.gz!!a.csv', hive_partitioning=false)
+----
+Unknown stream option 'nope'
+
+# Bad max_bytes suffix -> error.
+statement error
+SELECT * FROM read_csv('archive-stream://[max_bytes=1XB]/examples/a.tar.gz!!a.csv', hive_partitioning=false)
+----
+Invalid max_bytes value
+
+# ---------------------------------------------------------------------------
+# 6. Glob preserves scheme + bracketed options segment verbatim.
+# ---------------------------------------------------------------------------
+query I
+SELECT file FROM glob('archive-stream://[max_bytes=10]/examples/a.tar.gz!!*.csv') ORDER BY file
+----
+archive-stream://[max_bytes=10]/examples/a.tar.gz!!/a.csv
+archive-stream://[max_bytes=10]/examples/a.tar.gz!!/b.csv
+
+# No-brackets form: scheme preserved, no spurious options literal.
+query I
+SELECT file FROM glob('archive-stream://examples/a.tar.gz!!*.csv') ORDER BY file
+----
+archive-stream://examples/a.tar.gz!!/a.csv
+archive-stream://examples/a.tar.gz!!/b.csv
+
+# ---------------------------------------------------------------------------
+# 7. Encrypted 7z: libarchive can detect encryption but cannot decrypt. We
+# surface a specific error rather than a generic read failure.
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM 'archive-stream://examples/a_encrypted.7z!!a.csv'
+----
+is encrypted

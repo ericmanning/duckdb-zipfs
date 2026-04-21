@@ -109,7 +109,7 @@ SELECT * FROM read_csv('zip-stream://[new_line=\r]/examples/a.zip/a.csv', hive_p
 statement error
 SELECT * FROM read_csv('zip-stream://[nope=1]/examples/a.zip/a.csv', hive_partitioning=false)
 ----
-Unknown zip-stream option 'nope'
+Unknown stream option 'nope'
 
 # Unknown suffix on max_bytes -> error.
 statement error
@@ -133,7 +133,7 @@ Invalid new_line value
 statement error
 SELECT * FROM read_csv('zip-stream://[max_bytes=1KB/examples/a.zip/a.csv', hive_partitioning=false)
 ----
-Unterminated '[' in zip-stream URL
+Unterminated '[' in stream URL
 
 # ---------------------------------------------------------------------------
 # 5. Glob preserves the scheme and the bracketed options segment verbatim so

@@ -2,18 +2,11 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
+#include "streaming_options.hpp"
 #include <miniz/miniz.h>
 #include <miniz/miniz_zip.h>
 
 namespace duckdb {
-
-enum class NewLineMode { AUTO, LF, CR, CRLF };
-
-struct StreamingOptions {
-  idx_t lines = 20480;
-  NewLineMode new_line = NewLineMode::AUTO;
-  idx_t max_bytes = 64ULL * 1024 * 1024;
-};
 
 class ZipFileHandle final : public FileHandle {
   friend class ZipFileSystem;

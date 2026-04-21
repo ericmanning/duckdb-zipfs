@@ -30,6 +30,7 @@ SELECT * FROM 'zip://az://yourstorageaccount.blob.core.windows.net/yourcontainer
 | `zip://http://example.com/a.zip/*.csv` | Web hosted zip file named `a.zip`, containing csv files.
 | `zip-stream://a.zip/big.csv` | Local zip file read with bounded memory via streaming decompression.
 | `archive://a.tar.gz!!*.csv` | Local archive file named `a.tar.gz`, containg csv files.
+| `archive-stream://a.7z!!big.csv` | Local libarchive-supported archive (tar, 7z, …) read with bounded memory.
 | `compressed://a.jsonl.bz2` | Local compressed ndjson file `a.jsonl.bz2`.
 
 File names passed into the `zip://` URL scheme are expected to end with `.zip`, which indicates the end of the zip file name. The path after
@@ -104,6 +105,23 @@ SELECT * FROM read_csv(
 ```
 
 URLs without brackets (defaults) are unaffected and can be read via the `SELECT * FROM 'path'` sugar with no extra flags.
+
+## Streaming reads with `archive-stream://`
+
+`archive-stream://` is the streaming counterpart of `archive://` — same idea as `zip-stream://` but routed through libarchive, so it works on tar, tar.gz, tar.bz2, tar.xz, 7z, and everything else libarchive handles. Not built on Windows (same constraint as `archive://`).
+
+```SQL
+SET zipfs_split='!!';
+SELECT * FROM 'archive-stream://examples/big.7z!!data.csv';
+```
+
+The bracketed-options grammar, option defaults (`lines=20480`, `new_line` auto, `max_bytes=64MB`), escape rules, and `hive_partitioning=false` caveat are all the same as for `zip-stream://`. Like `zip-stream://`, the handle reports `CanSeek()=false` and is single-threaded within an entry. Small entries that fit fully in the prefix buffer fall back to a regular seekable `archive://`-style handle with full within-entry parallelism.
+
+### 7z specifics
+
+7z uses solid compression: groups of entries share a single LZMA stream. Reading entry N inside a solid folder requires libarchive to decompress every preceding entry in the folder before reaching N. Libarchive discards those bytes as it goes, so **memory stays bounded**, but the open cost scales linearly with the cumulative uncompressed size of earlier entries in the same folder. For very large solid archives this can be slow; the tradeoff is part of the 7z format, not something this extension can work around.
+
+Limitations: encrypted entries are detected but not decrypted (libarchive has no decryption support) — the extension raises a specific error recommending external decryption. Multi-volume 7z (`.7z.001`, `.7z.002`, …) is not supported by libarchive and so not by this extension either.
 
 ### Single-threaded within an entry
 
